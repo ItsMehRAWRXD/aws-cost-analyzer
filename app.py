@@ -615,7 +615,9 @@ def subscribe():
     try:
         plan = request.json.get('plan')
         
-        if not stripe.api_key:
+        # Check if Stripe is properly configured
+        stripe_secret_key = os.getenv('STRIPE_SECRET_KEY')
+        if not stripe_secret_key or stripe_secret_key == 'None':
             return jsonify({'error': 'Payment processing not configured. Please contact support.'})
         
         # Stripe price IDs (replace with your actual price IDs)
@@ -627,6 +629,10 @@ def subscribe():
         
         if plan not in prices:
             return jsonify({'error': 'Invalid subscription plan selected.'})
+        
+        # Check if we have valid price IDs
+        if prices[plan] == f'price_{plan}_placeholder':
+            return jsonify({'error': f'{plan.title()} plan not yet configured. Please contact support.'})
         
         checkout_session = stripe.checkout.Session.create(
             payment_method_types=['card'],
