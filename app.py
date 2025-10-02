@@ -20,8 +20,15 @@ app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(16))
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
 
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'users.db')
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def init_db():
-    conn = sqlite3.connect('users.db')
+    conn = get_db()
     conn.execute('''CREATE TABLE IF NOT EXISTS users 
                     (id INTEGER PRIMARY KEY, email TEXT UNIQUE, password TEXT, 
                      stripe_customer_id TEXT, subscription_status TEXT DEFAULT 'free')''')
@@ -402,10 +409,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .link{text-align:center;margin-top:24px}
 .link a{color:#667eea;text-decoration:none;font-weight:500}
 .link a:hover{text-decoration:underline}
+.error{background:#f8d7da;color:#721c24;padding:12px;border-radius:8px;margin-bottom:16px;border:1px solid #f5c6cb}
 </style></head>
 <body>
 <div class="form">
 <h2>Create Account</h2>
+{{error}}
 <form method="POST">
 <input type="email" name="email" placeholder="Email address" class="input" required>
 <input type="password" name="password" placeholder="Create password" class="input" required>
@@ -425,37 +434,42 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        email = request.form['email']
-        password = hashlib.sha256(request.form['password'].encode()).hexdigest()
-        
-        conn = sqlite3.connect('users.db')
-        user = conn.execute('SELECT * FROM users WHERE email=? AND password=?', (email, password)).fetchone()
-        conn.close()
-        
-        if user:
-            session['user_id'] = user[0]
-            session['email'] = user[1]
-            return redirect('/dashboard')
-        return render_template_string(LOGIN_TEMPLATE + '<script>alert("Invalid email or password")</script>')
+        try:
+            email = request.form['email']
+            password = hashlib.sha256(request.form['password'].encode()).hexdigest()
+            
+            conn = get_db()
+            user = conn.execute('SELECT * FROM users WHERE email=? AND password=?', (email, password)).fetchone()
+            conn.close()
+            
+            if user:
+                session['user_id'] = user[0]
+                session['email'] = user[1]
+                return redirect('/dashboard')
+            return render_template_string(LOGIN_TEMPLATE + '<script>alert("Invalid email or password")</script>')
+        except Exception as e:
+            return f'Error: {str(e)}', 500
     
     return render_template_string(LOGIN_TEMPLATE)
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        email = request.form['email']
-        password = hashlib.sha256(request.form['password'].encode()).hexdigest()
-        
         try:
-            conn = sqlite3.connect('users.db')
+            email = request.form['email']
+            password = hashlib.sha256(request.form['password'].encode()).hexdigest()
+            
+            conn = get_db()
             conn.execute('INSERT INTO users (email, password) VALUES (?, ?)', (email, password))
             conn.commit()
             conn.close()
             return redirect('/login')
-        except:
-            return render_template_string(REGISTER_TEMPLATE + '<script>alert("Email already exists")</script>')
+        except sqlite3.IntegrityError:
+            return render_template_string(REGISTER_TEMPLATE.replace('{{error}}', '<div class="error">This email is already registered. Please <a href="/login" style="color:#721c24;font-weight:600">sign in</a> instead.</div>'))
+        except Exception as e:
+            return f'Error: {str(e)}', 500
     
-    return render_template_string(REGISTER_TEMPLATE)
+    return render_template_string(REGISTER_TEMPLATE.replace('{{error}}', ''))
 
 @app.route('/dashboard')
 @auth_required
