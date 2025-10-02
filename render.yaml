@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: aws-cost-analyzer
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_STARTER_PRICE_ID
+        sync: false
+      - key: STRIPE_PROFESSIONAL_PRICE_ID
+        sync: false
+      - key: PORT
+        value: 5000
+
+databases:
+  - name: aws-cost-db
+    databaseName: users
+    user: admin

@@ -1,0 +1,33 @@
+GitHub Setup Instructions
+========================
+
+1. Go to https://github.com/new
+
+2. Create new repository:
+   - Name: aws-cost-analyzer
+   - Description: AWS Cost Optimization SaaS
+   - Public or Private
+   - Don't initialize with README
+
+3. Open Git Bash or Terminal in D:\aws-cost-saas-turnkey
+
+4. Run these commands:
+
+git init
+git add .
+git commit -m "Initial commit - AWS Cost Analyzer SaaS"
+git branch -M main
+git remote add origin https://github.com/YOUR_USERNAME/aws-cost-analyzer.git
+git push -u origin main
+
+5. Done! Your repo is live at:
+   https://github.com/YOUR_USERNAME/aws-cost-analyzer
+
+6. Deploy to Render.com:
+   - Go to render.com
+   - Click "New +" > "Web Service"
+   - Connect your GitHub repo
+   - Render auto-detects render.yaml
+   - Add Stripe keys in Environment
+   - Click "Create Web Service"
+   - Live in 2 minutes!
