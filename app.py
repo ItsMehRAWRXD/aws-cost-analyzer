@@ -11,8 +11,6 @@ import stripe
 import secrets
 from functools import wraps
 import hashlib
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,6 +23,8 @@ def get_db():
     # Use Render's PostgreSQL database
     database_url = os.getenv('DATABASE_URL')
     if database_url:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
         conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
     else:
         # Fallback to local SQLite for development
@@ -472,7 +472,11 @@ def login():
             
             conn = get_db()
             cursor = conn.cursor()
-            cursor.execute('SELECT * FROM users WHERE email=%s AND password=%s', (email, password))
+            # Use appropriate placeholder for database type
+            if os.getenv('DATABASE_URL'):
+                cursor.execute('SELECT * FROM users WHERE email=%s AND password=%s', (email, password))
+            else:
+                cursor.execute('SELECT * FROM users WHERE email=? AND password=?', (email, password))
             user = cursor.fetchone()
             cursor.close()
             conn.close()
@@ -496,15 +500,20 @@ def register():
             
             conn = get_db()
             cursor = conn.cursor()
-            cursor.execute('INSERT INTO users (email, password) VALUES (%s, %s)', (email, password))
+            # Use appropriate placeholder for database type
+            if os.getenv('DATABASE_URL'):
+                cursor.execute('INSERT INTO users (email, password) VALUES (%s, %s)', (email, password))
+            else:
+                cursor.execute('INSERT INTO users (email, password) VALUES (?, ?)', (email, password))
             conn.commit()
             cursor.close()
             conn.close()
             return redirect('/login')
-        except (sqlite3.IntegrityError, psycopg2.IntegrityError):
-            return render_template_string(REGISTER_TEMPLATE.replace('{{error}}', '<div class="error">This email is already registered. Please <a href="/login" style="color:#721c24;font-weight:600">sign in</a> instead.</div>'))
         except Exception as e:
-            return f'Error: {str(e)}', 500
+            if 'UNIQUE constraint failed' in str(e) or 'duplicate key value' in str(e):
+                return render_template_string(REGISTER_TEMPLATE.replace('{{error}}', '<div class="error">This email is already registered. Please <a href="/login" style="color:#721c24;font-weight:600">sign in</a> instead.</div>'))
+            else:
+                return f'Error: {str(e)}', 500
     
     return render_template_string(REGISTER_TEMPLATE.replace('{{error}}', ''))
 

@@ -1,9 +1,9 @@
 import os
-import psycopg2
 
 # Use Render's PostgreSQL database
 database_url = os.getenv('DATABASE_URL')
 if database_url:
+    import psycopg2
     conn = psycopg2.connect(database_url)
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS users 
