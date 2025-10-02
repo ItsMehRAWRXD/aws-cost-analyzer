@@ -11,7 +11,8 @@ import stripe
 import secrets
 from functools import wraps
 import hashlib
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,19 +21,37 @@ app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(16))
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'users.db')
-
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    # Use Render's PostgreSQL database
+    database_url = os.getenv('DATABASE_URL')
+    if database_url:
+        conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
+    else:
+        # Fallback to local SQLite for development
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'users.db')
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = get_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS users 
-                    (id INTEGER PRIMARY KEY, email TEXT UNIQUE, password TEXT, 
-                     stripe_customer_id TEXT, subscription_status TEXT DEFAULT 'free')''')
+    cursor = conn.cursor()
+    
+    # Check if we're using PostgreSQL or SQLite
+    if os.getenv('DATABASE_URL'):
+        # PostgreSQL syntax
+        cursor.execute('''CREATE TABLE IF NOT EXISTS users 
+                        (id SERIAL PRIMARY KEY, email VARCHAR(255) UNIQUE, password VARCHAR(255), 
+                         stripe_customer_id VARCHAR(255), subscription_status VARCHAR(50) DEFAULT 'free')''')
+    else:
+        # SQLite syntax
+        cursor.execute('''CREATE TABLE IF NOT EXISTS users 
+                        (id INTEGER PRIMARY KEY, email TEXT UNIQUE, password TEXT, 
+                         stripe_customer_id TEXT, subscription_status TEXT DEFAULT 'free')''')
+    
     conn.commit()
+    cursor.close()
     conn.close()
 
 def auth_required(f):
@@ -452,12 +471,15 @@ def login():
             password = hashlib.sha256(request.form['password'].encode()).hexdigest()
             
             conn = get_db()
-            user = conn.execute('SELECT * FROM users WHERE email=? AND password=?', (email, password)).fetchone()
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM users WHERE email=%s AND password=%s', (email, password))
+            user = cursor.fetchone()
+            cursor.close()
             conn.close()
             
             if user:
-                session['user_id'] = user[0]
-                session['email'] = user[1]
+                session['user_id'] = user['id'] if isinstance(user, dict) else user[0]
+                session['email'] = user['email'] if isinstance(user, dict) else user[1]
                 return redirect('/dashboard')
             return render_template_string(LOGIN_TEMPLATE + '<script>alert("Invalid email or password")</script>')
         except Exception as e:
@@ -473,11 +495,13 @@ def register():
             password = hashlib.sha256(request.form['password'].encode()).hexdigest()
             
             conn = get_db()
-            conn.execute('INSERT INTO users (email, password) VALUES (?, ?)', (email, password))
+            cursor = conn.cursor()
+            cursor.execute('INSERT INTO users (email, password) VALUES (%s, %s)', (email, password))
             conn.commit()
+            cursor.close()
             conn.close()
             return redirect('/login')
-        except sqlite3.IntegrityError:
+        except (sqlite3.IntegrityError, psycopg2.IntegrityError):
             return render_template_string(REGISTER_TEMPLATE.replace('{{error}}', '<div class="error">This email is already registered. Please <a href="/login" style="color:#721c24;font-weight:600">sign in</a> instead.</div>'))
         except Exception as e:
             return f'Error: {str(e)}', 500
