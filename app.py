@@ -199,6 +199,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </ul>
 <button class="btn" onclick="subscribe('professional')" style="width:100%">Start Free Trial</button>
 </div>
+<div class="pricing-card">
+<h3>Enterprise</h3>
+<div class="price">$299<small style="font-size:0.4em">/month</small></div>
+<ul style="text-align:left;margin:24px 0;list-style:none;padding:0">
+<li style="padding:8px 0">✓ Everything in Professional</li>
+<li style="padding:8px 0">✓ Dedicated account manager</li>
+<li style="padding:8px 0">✓ Custom integrations</li>
+<li style="padding:8px 0">✓ SLA guarantee</li>
+<li style="padding:8px 0">✓ White-label options</li>
+<li style="padding:8px 0">✓ 24/7 phone support</li>
+</ul>
+<button class="btn" onclick="subscribe('enterprise')" style="width:100%">Contact Sales</button>
+</div>
 </div>
 </div>
 </div>
@@ -575,7 +588,8 @@ def subscribe():
         # Stripe price IDs (replace with your actual price IDs)
         prices = {
             'starter': os.getenv('STRIPE_STARTER_PRICE_ID', 'price_starter_placeholder'),
-            'professional': os.getenv('STRIPE_PROFESSIONAL_PRICE_ID', 'price_professional_placeholder')
+            'professional': os.getenv('STRIPE_PROFESSIONAL_PRICE_ID', 'price_professional_placeholder'),
+            'enterprise': os.getenv('STRIPE_ENTERPRISE_PRICE_ID', 'price_enterprise_placeholder')
         }
         
         if plan not in prices:
@@ -624,6 +638,10 @@ def success():
     '''
 
 if __name__ == '__main__':
-    init_db()
+    try:
+        init_db()
+        print("Database initialized successfully")
+    except Exception as e:
+        print(f"Database init error: {e}")
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
