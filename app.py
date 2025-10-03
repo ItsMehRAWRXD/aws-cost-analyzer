@@ -10,6 +10,7 @@ import json
 import stripe
 import secrets
 import sys
+from datetime import datetime
 from functools import wraps
 import hashlib
 from dotenv import load_dotenv
@@ -19,6 +20,12 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(16))
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
+
+# Create uploads directory for persistent file storage
+UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
 def get_db():
     # Use Render's PostgreSQL database
@@ -44,12 +51,235 @@ def init_db():
         # PostgreSQL syntax
         cursor.execute('''CREATE TABLE IF NOT EXISTS users 
                         (id SERIAL PRIMARY KEY, email VARCHAR(255) UNIQUE, password VARCHAR(255), 
-                         stripe_customer_id VARCHAR(255), subscription_status VARCHAR(50) DEFAULT 'free')''')
+                         stripe_customer_id VARCHAR(255), subscription_status VARCHAR(50) DEFAULT 'free',
+                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_login TIMESTAMP)''')
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_files 
+                        (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                         filename VARCHAR(255), file_type VARCHAR(50), file_size INTEGER,
+                         upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP, analysis_data JSON,
+                         status VARCHAR(50) DEFAULT 'uploaded')''')
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS analysis_history 
+                        (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                         monthly_bill DECIMAL(10,2), services TEXT, region VARCHAR(100),
+                         workload_type VARCHAR(50), potential_savings DECIMAL(10,2),
+                         analysis_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP, recommendations JSON)''')
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_sessions 
+                        (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                         session_data JSON, last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                         is_active BOOLEAN DEFAULT TRUE)''')
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_todos 
+                        (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                         title VARCHAR(255) NOT NULL, description TEXT, priority VARCHAR(20) DEFAULT 'medium',
+                         category VARCHAR(50) DEFAULT 'general', status VARCHAR(20) DEFAULT 'pending',
+                         due_date TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                         completed_at TIMESTAMP, analysis_id INTEGER REFERENCES analysis_history(id))''')
     else:
         # SQLite syntax
         cursor.execute('''CREATE TABLE IF NOT EXISTS users 
                         (id INTEGER PRIMARY KEY, email TEXT UNIQUE, password TEXT, 
-                         stripe_customer_id TEXT, subscription_status TEXT DEFAULT 'free')''')
+                         stripe_customer_id TEXT, subscription_status TEXT DEFAULT 'free',
+                         created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_login DATETIME)''')
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_files 
+                        (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                         filename TEXT, file_type TEXT, file_size INTEGER,
+                         upload_date DATETIME DEFAULT CURRENT_TIMESTAMP, analysis_data TEXT,
+                         status TEXT DEFAULT 'uploaded')''')
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS analysis_history 
+                        (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                         monthly_bill REAL, services TEXT, region TEXT,
+                         workload_type TEXT, potential_savings REAL,
+                         analysis_date DATETIME DEFAULT CURRENT_TIMESTAMP, recommendations TEXT)''')
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_sessions 
+                        (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                         session_data TEXT, last_activity DATETIME DEFAULT CURRENT_TIMESTAMP,
+                         is_active BOOLEAN DEFAULT 1)''')
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_todos 
+                        (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                         title TEXT NOT NULL, description TEXT, priority TEXT DEFAULT 'medium',
+                         category TEXT DEFAULT 'general', status TEXT DEFAULT 'pending',
+                         due_date DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                         completed_at DATETIME, analysis_id INTEGER REFERENCES analysis_history(id))''')
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def save_user_session(user_id, session_data):
+    """Save user session data to database for persistence"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    session_json = json.dumps(session_data) if isinstance(session_data, dict) else str(session_data)
+    
+    if os.getenv('DATABASE_URL'):
+        cursor.execute('''INSERT INTO user_sessions (user_id, session_data, last_activity, is_active)
+                         VALUES (%s, %s, CURRENT_TIMESTAMP, TRUE)
+                         ON CONFLICT (user_id) DO UPDATE SET 
+                         session_data = EXCLUDED.session_data,
+                         last_activity = EXCLUDED.last_activity,
+                         is_active = TRUE''', (user_id, session_json))
+    else:
+        cursor.execute('''INSERT OR REPLACE INTO user_sessions (user_id, session_data, last_activity, is_active)
+                         VALUES (?, ?, CURRENT_TIMESTAMP, 1)''', (user_id, session_json))
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def load_user_session(user_id):
+    """Load user session data from database"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    if os.getenv('DATABASE_URL'):
+        cursor.execute('SELECT session_data FROM user_sessions WHERE user_id = %s AND is_active = TRUE', (user_id,))
+    else:
+        cursor.execute('SELECT session_data FROM user_sessions WHERE user_id = ? AND is_active = 1', (user_id,))
+    
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if result:
+        try:
+            return json.loads(result[0])
+        except:
+            return {}
+    return {}
+
+def save_analysis_history(user_id, analysis_data):
+    """Save cost analysis to history for persistence"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    recommendations_json = json.dumps(analysis_data.get('recommendations', []))
+    
+    if os.getenv('DATABASE_URL'):
+        cursor.execute('''INSERT INTO analysis_history 
+                         (user_id, monthly_bill, services, region, workload_type, potential_savings, recommendations)
+                         VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+                      (user_id, analysis_data.get('monthly_bill'), 
+                       analysis_data.get('services'), analysis_data.get('region'),
+                       analysis_data.get('workload_type'), analysis_data.get('potential_savings'),
+                       recommendations_json))
+    else:
+        cursor.execute('''INSERT INTO analysis_history 
+                         (user_id, monthly_bill, services, region, workload_type, potential_savings, recommendations)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                      (user_id, analysis_data.get('monthly_bill'), 
+                       analysis_data.get('services'), analysis_data.get('region'),
+                       analysis_data.get('workload_type'), analysis_data.get('potential_savings'),
+                       recommendations_json))
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def get_analysis_history(user_id):
+    """Get user's analysis history"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    if os.getenv('DATABASE_URL'):
+        cursor.execute('''SELECT * FROM analysis_history WHERE user_id = %s 
+                         ORDER BY analysis_date DESC LIMIT 10''', (user_id,))
+    else:
+        cursor.execute('''SELECT * FROM analysis_history WHERE user_id = ? 
+                         ORDER BY analysis_date DESC LIMIT 10''', (user_id,))
+    
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return results
+
+def save_todo(user_id, todo_data):
+    """Save a new todo item"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    if os.getenv('DATABASE_URL'):
+        cursor.execute('''INSERT INTO user_todos 
+                         (user_id, title, description, priority, category, status, due_date, analysis_id)
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
+                      (user_id, todo_data.get('title'), todo_data.get('description'),
+                       todo_data.get('priority', 'medium'), todo_data.get('category', 'general'),
+                       todo_data.get('status', 'pending'), todo_data.get('due_date'),
+                       todo_data.get('analysis_id')))
+    else:
+        cursor.execute('''INSERT INTO user_todos 
+                         (user_id, title, description, priority, category, status, due_date, analysis_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                      (user_id, todo_data.get('title'), todo_data.get('description'),
+                       todo_data.get('priority', 'medium'), todo_data.get('category', 'general'),
+                       todo_data.get('status', 'pending'), todo_data.get('due_date'),
+                       todo_data.get('analysis_id')))
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def get_user_todos(user_id, status=None):
+    """Get user's todos, optionally filtered by status"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    if status:
+        if os.getenv('DATABASE_URL'):
+            cursor.execute('''SELECT * FROM user_todos WHERE user_id = %s AND status = %s 
+                             ORDER BY created_at DESC''', (user_id, status))
+        else:
+            cursor.execute('''SELECT * FROM user_todos WHERE user_id = ? AND status = ? 
+                             ORDER BY created_at DESC''', (user_id, status))
+    else:
+        if os.getenv('DATABASE_URL'):
+            cursor.execute('''SELECT * FROM user_todos WHERE user_id = %s 
+                             ORDER BY created_at DESC''', (user_id,))
+        else:
+            cursor.execute('''SELECT * FROM user_todos WHERE user_id = ? 
+                             ORDER BY created_at DESC''', (user_id,))
+    
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return results
+
+def update_todo_status(user_id, todo_id, status):
+    """Update todo status (pending/completed)"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    completed_at = datetime.now() if status == 'completed' else None
+    
+    if os.getenv('DATABASE_URL'):
+        cursor.execute('''UPDATE user_todos SET status = %s, completed_at = %s 
+                         WHERE id = %s AND user_id = %s''',
+                      (status, completed_at, todo_id, user_id))
+    else:
+        cursor.execute('''UPDATE user_todos SET status = ?, completed_at = ? 
+                         WHERE id = ? AND user_id = ?''',
+                      (status, completed_at, todo_id, user_id))
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def delete_todo(user_id, todo_id):
+    """Delete a todo item"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    if os.getenv('DATABASE_URL'):
+        cursor.execute('DELETE FROM user_todos WHERE id = %s AND user_id = %s', (todo_id, user_id))
+    else:
+        cursor.execute('DELETE FROM user_todos WHERE id = ? AND user_id = ?', (todo_id, user_id))
     
     conn.commit()
     cursor.close()
@@ -113,6 +343,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <button class="tab-btn active" onclick="showTab('dashboard')">Dashboard</button>
 <button class="tab-btn" onclick="showTab('analyze')">Cost Analysis</button>
 <button class="tab-btn" onclick="showTab('files')">File Manager</button>
+<button class="tab-btn" onclick="showTab('tasks')">Task Manager</button>
 <button class="tab-btn" onclick="showTab('pricing')">Upgrade Plan</button>
 </div>
 
@@ -189,6 +420,84 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div id="results" style="margin-top:40px;display:none">
 <h3>Cost Analysis Results</h3>
 <div id="resultsContent"></div>
+</div>
+</div>
+
+<div id="tasks" class="tab-content">
+<h2 style="margin-bottom:30px">Task Manager</h2>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:30px;margin-bottom:30px">
+<div>
+<h3 style="margin-bottom:20px">Create New Task</h3>
+<form id="todoForm">
+<div class="form-group">
+<label>Task Title</label>
+<input type="text" id="todoTitle" placeholder="e.g., Review EC2 instances for optimization" required>
+</div>
+<div class="form-group">
+<label>Description (Optional)</label>
+<textarea id="todoDescription" placeholder="Add details about this task..." rows="3" style="width:100%;padding:12px 16px;border:2px solid #e9ecef;border-radius:8px;font-size:16px;resize:vertical"></textarea>
+</div>
+<div class="form-group">
+<label>Priority</label>
+<select id="todoPriority">
+<option value="low">Low</option>
+<option value="medium" selected>Medium</option>
+<option value="high">High</option>
+<option value="urgent">Urgent</option>
+</select>
+</div>
+<div class="form-group">
+<label>Category</label>
+<select id="todoCategory">
+<option value="cost-optimization">Cost Optimization</option>
+<option value="security">Security</option>
+<option value="performance">Performance</option>
+<option value="monitoring">Monitoring</option>
+<option value="general" selected>General</option>
+</select>
+</div>
+<div class="form-group">
+<label>Due Date (Optional)</label>
+<input type="date" id="todoDueDate">
+</div>
+<button type="submit" class="btn" style="width:100%">Create Task</button>
+</form>
+</div>
+
+<div>
+<h3 style="margin-bottom:20px">Quick Actions</h3>
+<div style="display:grid;gap:12px">
+<button class="btn" onclick="createQuickTodo('Review unused EBS volumes', 'cost-optimization', 'high')" style="background:#28a745;text-align:left">
+📦 Review Unused EBS Volumes
+</button>
+<button class="btn" onclick="createQuickTodo('Check RDS instance sizing', 'cost-optimization', 'medium')" style="background:#ffc107;color:#000;text-align:left">
+🗄️ Check RDS Instance Sizing
+</button>
+<button class="btn" onclick="createQuickTodo('Review S3 storage classes', 'cost-optimization', 'medium')" style="background:#17a2b8;text-align:left">
+☁️ Review S3 Storage Classes
+</button>
+<button class="btn" onclick="createQuickTodo('Set up cost alerts', 'monitoring', 'high')" style="background:#dc3545;text-align:left">
+🚨 Set Up Cost Alerts
+</button>
+<button class="btn" onclick="createQuickTodo('Review IAM permissions', 'security', 'medium')" style="background:#6f42c1;text-align:left">
+🔐 Review IAM Permissions
+</button>
+</div>
+</div>
+</div>
+
+<div style="background:#f8f9fa;border-radius:12px;padding:24px">
+<h3 style="margin-bottom:20px">Your Tasks</h3>
+<div style="display:flex;gap:12px;margin-bottom:20px">
+<button class="btn" onclick="filterTodos('all')" id="filterAll" style="background:#667eea">All</button>
+<button class="btn" onclick="filterTodos('pending')" id="filterPending" style="background:#6c757d">Pending</button>
+<button class="btn" onclick="filterTodos('completed')" id="filterCompleted" style="background:#6c757d">Completed</button>
+</div>
+<div id="todosList" style="display:grid;gap:12px">
+<div style="text-align:center;color:#6c757d;padding:40px">
+Loading your tasks...
+</div>
+</div>
 </div>
 </div>
 
@@ -619,6 +928,220 @@ recommendationsHtml += `
 
 document.getElementById('fileRecommendations').innerHTML = recommendationsHtml;
 }
+
+// Task Management Functions
+let currentFilter = 'all';
+
+// Load todos on page load
+document.addEventListener('DOMContentLoaded', function() {
+    loadTodos();
+    
+    // Add form submit handler
+    document.getElementById('todoForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+        createTodo();
+    });
+});
+
+async function loadTodos() {
+    try {
+        const response = await fetch('/api/todos');
+        const data = await response.json();
+        
+        if (data.status === 'success') {
+            displayTodos(data.todos);
+        } else {
+            console.error('Failed to load todos:', data.error);
+        }
+    } catch (error) {
+        console.error('Error loading todos:', error);
+    }
+}
+
+function displayTodos(todos) {
+    const todosList = document.getElementById('todosList');
+    
+    if (todos.length === 0) {
+        todosList.innerHTML = '<div style="text-align:center;color:#6c757d;padding:40px">No tasks yet. Create your first task to get started!</div>';
+        return;
+    }
+    
+    let html = '';
+    todos.forEach(todo => {
+        if (currentFilter !== 'all' && todo.status !== currentFilter) return;
+        
+        const priorityColors = {
+            'urgent': '#dc3545',
+            'high': '#fd7e14',
+            'medium': '#ffc107',
+            'low': '#28a745'
+        };
+        
+        const statusIcon = todo.status === 'completed' ? '✅' : '⏳';
+        const statusClass = todo.status === 'completed' ? 'completed' : 'pending';
+        
+        html += `
+        <div class="todo-item" style="background:white;border-radius:8px;padding:16px;border:1px solid #e9ecef;display:flex;justify-content:space-between;align-items:center">
+            <div style="flex:1">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                    <span style="font-size:1.2em">${statusIcon}</span>
+                    <h4 style="margin:0;color:#495057;text-decoration:${todo.status === 'completed' ? 'line-through' : 'none'}">${todo.title}</h4>
+                    <span style="background:${priorityColors[todo.priority]};color:white;padding:2px 8px;border-radius:4px;font-size:0.8em">${todo.priority}</span>
+                </div>
+                ${todo.description ? `<p style="margin:4px 0;color:#6c757d;font-size:0.9em">${todo.description}</p>` : ''}
+                <div style="display:flex;gap:12px;font-size:0.8em;color:#6c757d;margin-top:8px">
+                    <span>📁 ${todo.category}</span>
+                    <span>📅 ${new Date(todo.created_at).toLocaleDateString()}</span>
+                    ${todo.due_date ? `<span>⏰ Due: ${new Date(todo.due_date).toLocaleDateString()}</span>` : ''}
+                </div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center">
+                ${todo.status === 'pending' ? 
+                    `<button onclick="toggleTodo(${todo.id}, 'completed')" style="background:#28a745;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:0.8em">Complete</button>` :
+                    `<button onclick="toggleTodo(${todo.id}, 'pending')" style="background:#6c757d;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:0.8em">Undo</button>`
+                }
+                <button onclick="deleteTodo(${todo.id})" style="background:#dc3545;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:0.8em">Delete</button>
+            </div>
+        </div>`;
+    });
+    
+    todosList.innerHTML = html;
+}
+
+async function createTodo() {
+    const title = document.getElementById('todoTitle').value;
+    const description = document.getElementById('todoDescription').value;
+    const priority = document.getElementById('todoPriority').value;
+    const category = document.getElementById('todoCategory').value;
+    const dueDate = document.getElementById('todoDueDate').value;
+    
+    if (!title.trim()) {
+        alert('Please enter a task title');
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/todos', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                title: title,
+                description: description,
+                priority: priority,
+                category: category,
+                due_date: dueDate || null
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (data.status === 'success') {
+            // Clear form
+            document.getElementById('todoForm').reset();
+            document.getElementById('todoPriority').value = 'medium';
+            document.getElementById('todoCategory').value = 'general';
+            
+            // Reload todos
+            loadTodos();
+        } else {
+            alert('Failed to create task: ' + data.error);
+        }
+    } catch (error) {
+        console.error('Error creating todo:', error);
+        alert('Failed to create task');
+    }
+}
+
+async function createQuickTodo(title, category, priority) {
+    try {
+        const response = await fetch('/api/todos', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                title: title,
+                description: 'Quick action task created from recommendations',
+                priority: priority,
+                category: category
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (data.status === 'success') {
+            loadTodos();
+        } else {
+            alert('Failed to create task: ' + data.error);
+        }
+    } catch (error) {
+        console.error('Error creating quick todo:', error);
+        alert('Failed to create task');
+    }
+}
+
+async function toggleTodo(todoId, newStatus) {
+    try {
+        const response = await fetch(`/api/todos/${todoId}`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                status: newStatus
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (data.status === 'success') {
+            loadTodos();
+        } else {
+            alert('Failed to update task: ' + data.error);
+        }
+    } catch (error) {
+        console.error('Error updating todo:', error);
+        alert('Failed to update task');
+    }
+}
+
+async function deleteTodo(todoId) {
+    if (!confirm('Are you sure you want to delete this task?')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/todos/${todoId}`, {
+            method: 'DELETE'
+        });
+        
+        const data = await response.json();
+        
+        if (data.status === 'success') {
+            loadTodos();
+        } else {
+            alert('Failed to delete task: ' + data.error);
+        }
+    } catch (error) {
+        console.error('Error deleting todo:', error);
+        alert('Failed to delete task');
+    }
+}
+
+function filterTodos(status) {
+    currentFilter = status;
+    
+    // Update button styles
+    document.querySelectorAll('[id^="filter"]').forEach(btn => {
+        btn.style.background = '#6c757d';
+    });
+    document.getElementById(`filter${status.charAt(0).toUpperCase() + status.slice(1)}`).style.background = '#667eea';
+    
+    // Reload todos with filter
+    loadTodos();
+}
 </script>
 </body></html>
 """
@@ -708,8 +1231,24 @@ def login():
             conn.close()
             
             if user:
-                session['user_id'] = user['id'] if isinstance(user, dict) else user[0]
-                session['email'] = user['email'] if isinstance(user, dict) else user[1]
+                user_id = user['id'] if isinstance(user, dict) else user[0]
+                user_email = user['email'] if isinstance(user, dict) else user[1]
+                
+                # Set session data
+                session['user_id'] = user_id
+                session['email'] = user_email
+                
+                # Save session data to database for persistence
+                session_data = {
+                    'user_id': user_id,
+                    'email': user_email,
+                    'login_time': str(datetime.now()),
+                    'last_activity': str(datetime.now()),
+                    'uploaded_files': [],
+                    'analysis_history': []
+                }
+                save_user_session(user_id, session_data)
+                
                 return redirect('/dashboard')
             return render_template_string(LOGIN_TEMPLATE + '<script>alert("Invalid email or password")</script>')
         except Exception as e:
@@ -887,29 +1426,67 @@ def subscribe():
 @auth_required
 def upload_file():
     try:
-        # Get uploaded files
-        files = []
+        user_id = session.get('user_id')
+        uploaded_files = []
+        
+        # Process each uploaded file
         for key in ['billingFile', 'configFile', 'customFile']:
             if key in request.files:
                 file = request.files[key]
                 if file and file.filename:
-                    files.append({
-                        'name': file.filename,
-                        'size': len(file.read()),
-                        'type': file.content_type
+                    # Generate unique filename
+                    filename = f"{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+                    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    
+                    # Save file to disk
+                    file.save(file_path)
+                    
+                    # Get file info
+                    file_size = os.path.getsize(file_path)
+                    
+                    # Save file info to database
+                    conn = get_db()
+                    cursor = conn.cursor()
+                    
+                    analysis_data = json.dumps({
+                        'upload_time': str(datetime.now()),
+                        'file_type': key,
+                        'original_name': file.filename
                     })
-                    file.seek(0)  # Reset file pointer
+                    
+                    if os.getenv('DATABASE_URL'):
+                        cursor.execute('''INSERT INTO user_files 
+                                         (user_id, filename, file_type, file_size, analysis_data, status)
+                                         VALUES (%s, %s, %s, %s, %s, %s)''',
+                                      (user_id, filename, file.content_type, file_size, analysis_data, 'uploaded'))
+                    else:
+                        cursor.execute('''INSERT INTO user_files 
+                                         (user_id, filename, file_type, file_size, analysis_data, status)
+                                         VALUES (?, ?, ?, ?, ?, ?)''',
+                                      (user_id, filename, file.content_type, file_size, analysis_data, 'uploaded'))
+                    
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                    
+                    uploaded_files.append({
+                        'name': file.filename,
+                        'size': file_size,
+                        'type': file.content_type,
+                        'saved_as': filename
+                    })
         
-        if not files:
+        if not uploaded_files:
             return jsonify({'error': 'No files uploaded'})
         
         # Simulate file analysis (in production, you'd actually analyze the files)
         analysis_results = {
             'status': 'success',
-            'files_processed': len(files),
+            'files_processed': len(uploaded_files),
             'total_services': 12,
             'cost_anomalies': 3,
             'optimization_opportunities': 5,
+            'uploaded_files': uploaded_files,
             'recommendations': [
                 {
                     'title': 'Unused EBS Volumes Detected',
@@ -936,6 +1513,165 @@ def upload_file():
         
     except Exception as e:
         return jsonify({'error': f'File upload failed: {str(e)}'})
+
+@app.route('/api/user-data', methods=['GET'])
+@auth_required
+def get_user_data():
+    """Get all persistent user data"""
+    try:
+        user_id = session.get('user_id')
+        
+        # Get user's uploaded files
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        if os.getenv('DATABASE_URL'):
+            cursor.execute('''SELECT filename, file_type, file_size, upload_date, analysis_data, status 
+                             FROM user_files WHERE user_id = %s ORDER BY upload_date DESC''', (user_id,))
+        else:
+            cursor.execute('''SELECT filename, file_type, file_size, upload_date, analysis_data, status 
+                             FROM user_files WHERE user_id = ? ORDER BY upload_date DESC''', (user_id,))
+        
+        files = cursor.fetchall()
+        
+        # Get analysis history
+        if os.getenv('DATABASE_URL'):
+            cursor.execute('''SELECT monthly_bill, services, region, workload_type, potential_savings, 
+                             analysis_date, recommendations FROM analysis_history 
+                             WHERE user_id = %s ORDER BY analysis_date DESC LIMIT 5''', (user_id,))
+        else:
+            cursor.execute('''SELECT monthly_bill, services, region, workload_type, potential_savings, 
+                             analysis_date, recommendations FROM analysis_history 
+                             WHERE user_id = ? ORDER BY analysis_date DESC LIMIT 5''', (user_id,))
+        
+        history = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        # Format the data
+        files_data = []
+        for file in files:
+            files_data.append({
+                'filename': file[0],
+                'file_type': file[1],
+                'file_size': file[2],
+                'upload_date': str(file[3]),
+                'analysis_data': json.loads(file[4]) if file[4] else {},
+                'status': file[5]
+            })
+        
+        history_data = []
+        for analysis in history:
+            history_data.append({
+                'monthly_bill': float(analysis[0]),
+                'services': analysis[1],
+                'region': analysis[2],
+                'workload_type': analysis[3],
+                'potential_savings': float(analysis[4]),
+                'analysis_date': str(analysis[5]),
+                'recommendations': json.loads(analysis[6]) if analysis[6] else []
+            })
+        
+        return jsonify({
+            'status': 'success',
+            'uploaded_files': files_data,
+            'analysis_history': history_data,
+            'total_files': len(files_data),
+            'total_analyses': len(history_data)
+        })
+        
+    except Exception as e:
+        return jsonify({'error': f'Failed to load user data: {str(e)}'})
+
+@app.route('/api/todos', methods=['GET', 'POST'])
+@auth_required
+def manage_todos():
+    """Get or create todos"""
+    user_id = session.get('user_id')
+    
+    if request.method == 'GET':
+        try:
+            status_filter = request.args.get('status')
+            todos = get_user_todos(user_id, status_filter)
+            
+            todos_data = []
+            for todo in todos:
+                todos_data.append({
+                    'id': todo[0],
+                    'title': todo[2],
+                    'description': todo[3],
+                    'priority': todo[4],
+                    'category': todo[5],
+                    'status': todo[6],
+                    'due_date': str(todo[7]) if todo[7] else None,
+                    'created_at': str(todo[8]),
+                    'completed_at': str(todo[9]) if todo[9] else None,
+                    'analysis_id': todo[10]
+                })
+            
+            return jsonify({
+                'status': 'success',
+                'todos': todos_data,
+                'total': len(todos_data)
+            })
+            
+        except Exception as e:
+            return jsonify({'error': f'Failed to load todos: {str(e)}'})
+    
+    elif request.method == 'POST':
+        try:
+            todo_data = request.json
+            
+            # Validate required fields
+            if not todo_data.get('title'):
+                return jsonify({'error': 'Title is required'})
+            
+            # Save todo
+            save_todo(user_id, todo_data)
+            
+            return jsonify({
+                'status': 'success',
+                'message': 'Todo created successfully'
+            })
+            
+        except Exception as e:
+            return jsonify({'error': f'Failed to create todo: {str(e)}'})
+
+@app.route('/api/todos/<int:todo_id>', methods=['PUT', 'DELETE'])
+@auth_required
+def manage_todo(todo_id):
+    """Update or delete a specific todo"""
+    user_id = session.get('user_id')
+    
+    if request.method == 'PUT':
+        try:
+            data = request.json
+            new_status = data.get('status')
+            
+            if new_status not in ['pending', 'completed']:
+                return jsonify({'error': 'Invalid status'})
+            
+            update_todo_status(user_id, todo_id, new_status)
+            
+            return jsonify({
+                'status': 'success',
+                'message': f'Todo marked as {new_status}'
+            })
+            
+        except Exception as e:
+            return jsonify({'error': f'Failed to update todo: {str(e)}'})
+    
+    elif request.method == 'DELETE':
+        try:
+            delete_todo(user_id, todo_id)
+            
+            return jsonify({
+                'status': 'success',
+                'message': 'Todo deleted successfully'
+            })
+            
+        except Exception as e:
+            return jsonify({'error': f'Failed to delete todo: {str(e)}'})
 
 @app.route('/success')
 @auth_required
