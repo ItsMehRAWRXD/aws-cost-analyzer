@@ -9,6 +9,7 @@ import os
 import json
 import stripe
 import secrets
+import sys
 from functools import wraps
 import hashlib
 from dotenv import load_dotenv
@@ -956,10 +957,26 @@ def success():
     '''
 
 if __name__ == '__main__':
-    try:
-        init_db()
-        print("Database initialized successfully")
-    except Exception as e:
-        print(f"Database init error: {e}")
+    print("🚀 Starting AWS Cost Analyzer SaaS...")
+    
+    # Initialize database with retry logic
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"Database initialization attempt {attempt + 1}/{max_retries}")
+            init_db()
+            print("✅ Database initialized successfully")
+            break
+        except Exception as e:
+            print(f"❌ Database init error (attempt {attempt + 1}): {e}")
+            if attempt == max_retries - 1:
+                print("💥 Failed to initialize database after all retries")
+                sys.exit(1)
+            else:
+                print("⏳ Retrying in 2 seconds...")
+                import time
+                time.sleep(2)
+    
     port = int(os.environ.get('PORT', 5000))
+    print(f"🌐 Starting Flask app on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
